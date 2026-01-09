@@ -1,4 +1,4 @@
-# KWinDashboardServer
+# KWin Dashboard
 
 KWin window/monitor/desktop state monitor and control server with JSON output and an
 optional WebSocket stream. The script uses KWin scripting (qdbus/gdbus) and collects
