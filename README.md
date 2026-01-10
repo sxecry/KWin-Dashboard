@@ -6,10 +6,11 @@ samples from the KWin journal log.
 
 ## Features
 
-- Window/monitor/desktop state as JSON
-- Window actions: activate, minimize, maximize, fullscreen, close
+- Window/monitor/desktop state as JSON (includes `active`, `fullScreen`, `on_all_desktops`, `appExec`)
+- Window actions: activate, minimize, maximize, restore, fullscreen/exit, close, pin toggle
 - Move windows between desktops or monitors
 - Optional WebSocket server for live state and commands
+- Optional keypress injection and app launch via WebSocket
 
 ## Requirements
 
@@ -18,6 +19,7 @@ samples from the KWin journal log.
 - qdbus/qdbus6 or gdbus
 - systemctl (user units) and journalctl
 - Optional: `websockets` Python package (for WS mode)
+- Optional: `wtype` or `xdotool` (for `KeyEvent`)
 
 ## Install (CachyOS, native Python)
 
@@ -62,6 +64,8 @@ Filter by PID (optional):
 ./kwin_dashboard.py --maximize &lt;WINID&gt;
 ./kwin_dashboard.py --restore &lt;WINID&gt;
 ./kwin_dashboard.py --fullscreen &lt;WINID&gt;
+./kwin_dashboard.py --fullscreen-exit &lt;WINID&gt;
+./kwin_dashboard.py --pin-toggle &lt;WINID&gt;
 ./kwin_dashboard.py --close &lt;WINID&gt;
 </code></pre>
 
@@ -94,6 +98,22 @@ Known `name` values:
 - `CloseEvent`
 - `SwitchDesktop`
 - `MoveWindow`
+- `MinimizeEvent`
+- `MaximizeEvent`
+- `RestoreEvent`
+- `FullscreenEvent`
+- `FullscreenExitEvent`
+- `PinToggleEvent`
+- `KeyEvent`
+- `LaunchApp`
+
+Common payload fields:
+
+- `windowId` (for window actions)
+- `desktopIndex` (for `SwitchDesktop`)
+- `targetMonitor`, `targetDesktop` (for `MoveWindow`)
+- `key` (for `KeyEvent`, e.g. `F`, `ctrl+w`, `Left`)
+- `exec` (for `LaunchApp`, typically the `appExec` value from state)
 
 Responses:
 
@@ -118,6 +138,9 @@ App capabilities:
 - Close applications
 - Move windows between monitors
 - Activate (focus) a window
+- Minimize/maximize/restore/fullscreen actions
+- Pin/unpin windows across desktops
+- Send keypresses to windows (if `wtype` or `xdotool` is installed)
 
 ## Firewall
 

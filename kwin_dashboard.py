@@ -6,6 +6,7 @@ import re
 import os
 import shutil
 import subprocess
+import shlex
 import tempfile
 import time
 from datetime import datetime, timezone
@@ -125,6 +126,41 @@ def find_window_fullscreen(payload_state: dict, window_id: str) -> bool:
                 if win.get("id") == window_id:
                     return bool(win.get("fullScreen"))
     return False
+
+def find_window_monitor(payload_state: dict, window_id: str) -> int | None:
+    for monitor in payload_state.get("monitors") or []:
+        monitor_id = monitor.get("monitor_id") or monitor.get("monitorId")
+        for desktop in monitor.get("desktops") or []:
+            for win in desktop.get("windows") or []:
+                if win.get("id") == window_id:
+                    return monitor_id
+    return None
+
+def find_window_pinned(payload_state: dict, window_id: str) -> bool | None:
+    for monitor in payload_state.get("monitors") or []:
+        for desktop in monitor.get("desktops") or []:
+            for win in desktop.get("windows") or []:
+                if win.get("id") == window_id:
+                    return bool(win.get("on_all_desktops"))
+    return None
+
+def is_monitor_all_pinned(payload_state: dict, monitor_id: int | None) -> bool:
+    if monitor_id is None:
+        return False
+    target = None
+    for monitor in payload_state.get("monitors") or []:
+        mid = monitor.get("monitor_id") or monitor.get("monitorId")
+        if mid == monitor_id:
+            target = monitor
+            break
+    if not target:
+        return False
+    windows = []
+    for desktop in target.get("desktops") or []:
+        windows.extend(desktop.get("windows") or [])
+    if not windows:
+        return False
+    return all(w.get("on_all_desktops") for w in windows)
 
 
 def run(cmd: list[str]) -> subprocess.CompletedProcess:
@@ -321,6 +357,7 @@ def build_js(target_pid: int | None) -> str:
   }};
   print(JSON.stringify(meta));
 
+  const aw = workspace.activeClient;
   for (let i = 0; i < wins.length; i++) {{
     const w = wins[i];
     if (!w) continue;
@@ -346,6 +383,9 @@ def build_js(target_pid: int | None) -> str:
       || (w.maximizedHoriz === true)
       || (w.maximizedVert === true);
 
+    const activeMatch = aw
+      ? (normId(aw.internalId) === normId(internalId) || normId(aw.windowId) === normId(windowId))
+      : false;
     const out = {{
       pid: w.pid,
       caption: w.caption || null,
@@ -366,7 +406,8 @@ def build_js(target_pid: int | None) -> str:
 
       minimized: !!w.minimized,
       maximized: maximized,
-      fullScreen: !!w.fullScreen
+      fullScreen: !!w.fullScreen,
+      active: (w.active === true) || activeMatch
     }};
 
     print(JSON.stringify(out));
@@ -511,11 +552,17 @@ def build_js_action(
       }}
     }} else if (action === "fullscreen") {{
       w.fullScreen = true;
+    }} else if (action === "fullscreen-exit") {{
+      w.fullScreen = false;
     }} else if (action === "close") {{
       if (typeof w.closeWindow === "function") {{
         w.closeWindow();
       }} else if (typeof workspace.closeWindow === "function") {{
         workspace.closeWindow(w);
+      }}
+    }} else if (action === "pin-toggle") {{
+      if (w.onAllDesktops !== undefined && w.onAllDesktops !== null) {{
+        w.onAllDesktops = !w.onAllDesktops;
       }}
     }} else if (action === "move-desktop") {{
       const dnum = parseInt(targetDesktop, 10);
@@ -579,13 +626,68 @@ def parse_json_lines(lines: list[str]) -> tuple[dict, list[dict]]:
             windows.append(obj)
     return meta, windows
 
-def iter_desktop_entry_name(path: str) -> str | None:
+def sanitize_exec_command(value: str | None) -> str | None:
+    if not value:
+        return None
+    placeholders = ("%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m")
+    parts = value.split()
+    kept = [part for part in parts if not (part in placeholders or part.startswith("%"))]
+    return " ".join(kept).strip() or None
+
+def launch_exec_command(exec_cmd: str | None) -> bool:
+    if not exec_cmd:
+        return False
+    try:
+        args = shlex.split(exec_cmd)
+        if not args:
+            return False
+        subprocess.Popen(args, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except Exception:
+        return False
+
+def send_keypress(key: str | None) -> bool:
+    if not key:
+        return False
+    tool = which_any("wtype", "xdotool")
+    if not tool:
+        return False
+    try:
+        if tool.endswith("wtype"):
+            if "+" in key:
+                parts = [p for p in key.split("+") if p]
+                if not parts:
+                    return False
+                modifiers = parts[:-1]
+                base = parts[-1]
+                cmd = [tool]
+                for mod in modifiers:
+                    cmd += ["-M", mod]
+                cmd += ["-k", base]
+                for mod in reversed(modifiers):
+                    cmd += ["-m", mod]
+                run(cmd)
+                return True
+            if len(key) == 1:
+                run([tool, key])
+                return True
+            run([tool, "-k", key])
+            return True
+        if tool.endswith("xdotool"):
+            run([tool, "key", "--clearmodifiers", key])
+            return True
+    except subprocess.CalledProcessError:
+        return False
+    return False
+
+def iter_desktop_entry_info(path: str) -> tuple[str | None, str | None]:
     lang = os.environ.get("LANG", "")
     lang = lang.split(".", 1)[0]
     lang_short = lang.split("_", 1)[0] if "_" in lang else ""
     in_section = False
     name = None
     localized = None
+    exec_cmd = None
     try:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             for raw in f:
@@ -608,9 +710,11 @@ def iter_desktop_entry_name(path: str) -> str | None:
                     localized = val
                 elif key == "X-GNOME-FullName" and not name:
                     name = val
+                elif key == "Exec":
+                    exec_cmd = sanitize_exec_command(val)
     except OSError:
-        return None
-    return localized or name
+        return None, None
+    return localized or name, exec_cmd
 
 def find_desktop_file(desktop_file_name: str) -> str | None:
     if not desktop_file_name:
@@ -644,19 +748,32 @@ def find_desktop_file(desktop_file_name: str) -> str | None:
     return None
 
 def enrich_app_names(windows: list[dict]) -> None:
-    cache: dict[str, str | None] = {}
+    cache: dict[str, tuple[str | None, str | None]] = {}
     for w in windows:
-        desktop_name = w.get("desktopFileName")
-        if not desktop_name:
-            w["appName"] = None
-            continue
-        if desktop_name in cache:
-            w["appName"] = cache[desktop_name]
-            continue
-        path = find_desktop_file(desktop_name)
-        app_name = iter_desktop_entry_name(path) if path else None
-        cache[desktop_name] = app_name
+        candidates = []
+        for key in ("desktopFileName", "resourceClass", "resourceName"):
+            val = w.get(key)
+            if not val:
+                continue
+            candidates.append(val)
+            lower = str(val).lower()
+            if lower != val:
+                candidates.append(lower)
+
+        app_name = None
+        app_exec = None
+        for candidate in candidates:
+            if candidate in cache:
+                app_name, app_exec = cache[candidate]
+            else:
+                path = find_desktop_file(str(candidate))
+                app_name, app_exec = iter_desktop_entry_info(path) if path else (None, None)
+                cache[candidate] = (app_name, app_exec)
+            if app_name or app_exec:
+                break
+
         w["appName"] = app_name
+        w["appExec"] = app_exec
 
 def get_service_candidates(preferred: str | None) -> list[str]:
     candidates = [
@@ -769,13 +886,15 @@ def build_desktop_windows(desktop_names: list[str], windows: list[dict], active_
             "windows": [
                 {
                     "id": w.get("windowId"),
-                    "pid": w.get("pid"),
                     "title": w.get("appName"),
+                    "pid": w.get("pid"),
                     "caption": w.get("caption"),
                     "on_all_desktops": w.get("onAllDesktops"),
                     "minimized": w.get("minimized"),
                     "maximized": w.get("maximized"),
                     "fullScreen": w.get("fullScreen"),
+                    "appExec": w.get("appExec"),
+                    "active": w.get("active"),
                 }
                 for w in wins
             ],
@@ -874,6 +993,8 @@ def main():
     ap.add_argument("--minimize", metavar="WINID", help="Minimize window by internalId/windowId.")
     ap.add_argument("--restore", metavar="WINID", help="Restore window (min/max off) by internalId/windowId.")
     ap.add_argument("--fullscreen", metavar="WINID", help="Set window fullscreen by internalId/windowId.")
+    ap.add_argument("--fullscreen-exit", metavar="WINID", help="Exit fullscreen by internalId/windowId.")
+    ap.add_argument("--pin-toggle", metavar="WINID", help="Toggle pin on all desktops by internalId/windowId.")
     ap.add_argument("--close", metavar="WINID", help="Close window by internalId/windowId.")
     ap.add_argument("--active", metavar="WINID", help="Activate window by internalId/windowId.")
     ap.add_argument("--move-desktop", nargs=2, metavar=("WINID", "DESKTOP"),
@@ -892,22 +1013,29 @@ def main():
     winid = None
     target_desktop = None
     target_monitor = None
-    for name in ("maximize", "minimize", "restore", "fullscreen", "close", "active"):
+    for name in ("maximize", "minimize", "restore", "fullscreen", "fullscreen_exit", "pin_toggle", "close", "active"):
         val = getattr(args, name)
         if val:
             if action:
-                ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--close/--active")
-            action = "activate" if name == "active" else name
+                ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--fullscreen-exit/--pin-toggle/--close/--active")
+            if name == "active":
+                action = "activate"
+            elif name == "fullscreen_exit":
+                action = "fullscreen-exit"
+            elif name == "pin_toggle":
+                action = "pin-toggle"
+            else:
+                action = name
             winid = val
     if args.move_desktop:
         if action:
-            ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--close/--active/--move-desktop/--move-monitor")
+            ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--fullscreen-exit/--pin-toggle/--close/--active/--move-desktop/--move-monitor")
         action = "move-desktop"
         winid = args.move_desktop[0]
         target_desktop = args.move_desktop[1]
     if args.move_monitor:
         if action:
-            ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--close/--active/--move-desktop/--move-monitor")
+            ap.error("Only one action can be used at a time: --maximize/--minimize/--restore/--fullscreen/--fullscreen-exit/--pin-toggle/--close/--active/--move-desktop/--move-monitor")
         action = "move-monitor"
         winid = args.move_monitor[0]
         target_monitor = args.move_monitor[1]
@@ -940,6 +1068,8 @@ def main():
             "desktop_index": payload.get("desktopIndex"),
             "target_monitor": payload.get("targetMonitor"),
             "target_desktop": payload.get("targetDesktop"),
+            "exec_cmd": payload.get("exec"),
+            "key": payload.get("key"),
             "raw": obj,
         }
 
@@ -957,12 +1087,75 @@ def main():
         desktop_index = cmd.get("desktop_index")
         target_monitor = cmd.get("target_monitor")
         target_desktop = cmd.get("target_desktop")
+        exec_cmd = cmd.get("exec_cmd")
+        key = cmd.get("key")
 
         if name == "CloseEvent" and window_id:
             command = f"kwin close {window_id}"
             run_action(None, window_id, "close", None, None)
             await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
             await push_state(websocket)
+            return
+        if name == "MinimizeEvent" and window_id:
+            command = f"kwin minimize {window_id}"
+            run_action(None, window_id, "activate", None, None)
+            run_action(None, window_id, "minimize", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "MaximizeEvent" and window_id:
+            command = f"kwin maximize {window_id}"
+            run_action(None, window_id, "activate", None, None)
+            run_action(None, window_id, "maximize", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "RestoreEvent" and window_id:
+            command = f"kwin restore {window_id}"
+            run_action(None, window_id, "restore", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "FullscreenEvent" and window_id:
+            command = f"kwin fullscreen {window_id}"
+            run_action(None, window_id, "activate", None, None)
+            run_action(None, window_id, "fullscreen", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "FullscreenExitEvent" and window_id:
+            command = f"kwin fullscreen-exit {window_id}"
+            run_action(None, window_id, "activate", None, None)
+            run_action(None, window_id, "fullscreen-exit", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "PinToggleEvent" and window_id:
+            command = f"kwin pin-toggle {window_id}"
+            run_action(None, window_id, "pin-toggle", None, None)
+            await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+            await push_state(websocket)
+            return
+        if name == "LaunchApp" and exec_cmd:
+            command = f"exec {exec_cmd}"
+            if launch_exec_command(exec_cmd):
+                await send_ack(websocket, {"name": name, "command": command}, args.debug)
+                await push_state(websocket)
+            return
+        if name == "KeyEvent" and key:
+            command = f"key {key}"
+            if window_id:
+                run_action(None, window_id, "activate", None, None)
+                time.sleep(0.1)
+            if send_keypress(key):
+                await send_ack(websocket, {"name": name, "windowId": window_id, "command": command}, args.debug)
+                await push_state(websocket)
+            else:
+                await send_ack(
+                    websocket,
+                    {"name": name, "windowId": window_id, "command": f"error: key {key} failed"},
+                    args.debug
+                )
             return
 
         if name == "ActivateWindow" and window_id:
@@ -995,24 +1188,35 @@ def main():
 
         if name == "MoveWindow" and window_id and target_desktop:
             commands = []
+            payload_state = build_state()
+            should_pin = is_monitor_all_pinned(payload_state, target_monitor)
+            window_pinned = find_window_pinned(payload_state, window_id)
             if target_monitor:
-                commands.append(f"kwin move-monitor {window_id} {target_monitor}")
-                run_action(None, window_id, "activate", None, None)
-                used_shortcut = False
-                if str(target_monitor).isdigit():
-                    n = int(target_monitor)
-                    tried = []
-                    if n >= 1:
-                        tried.append(f"Window to Screen {n - 1}")
-                    tried.append(f"Window to Screen {n}")
-                    for shortcut_name in tried:
-                        if invoke_kwin_shortcut(shortcut_name):
-                            used_shortcut = True
-                            break
-                if not used_shortcut:
-                    run_action(None, window_id, "move-monitor", None, str(target_monitor))
+                current_monitor = find_window_monitor(payload_state, window_id)
+                if current_monitor is None or int(current_monitor) != int(target_monitor):
+                    commands.append(f"kwin activate {window_id}")
+                    run_action(None, window_id, "activate", None, None)
+                    time.sleep(0.2)
+                    used_shortcut = False
+                    if str(target_monitor).isdigit():
+                        n = int(target_monitor)
+                        tried = []
+                        if n >= 1:
+                            tried.append(f"Window to Screen {n - 1}")
+                        tried.append(f"Window to Screen {n}")
+                        for shortcut_name in tried:
+                            if invoke_kwin_shortcut(shortcut_name):
+                                commands.append(f"kwin shortcut {shortcut_name}")
+                                used_shortcut = True
+                                break
+                    if not used_shortcut:
+                        commands.append(f"kwin move-monitor {window_id} {target_monitor}")
+                        run_action(None, window_id, "move-monitor", None, str(target_monitor))
             commands.append(f"kwin move-desktop {window_id} {target_desktop}")
             run_action(None, window_id, "move-desktop", str(target_desktop), None)
+            if should_pin and window_pinned is False:
+                commands.append(f"kwin pin-toggle {window_id}")
+                run_action(None, window_id, "pin-toggle", None, None)
             commands.append(f"kwin activate {window_id}")
             run_action(None, window_id, "activate", None, None)
             payload_state = build_state()
